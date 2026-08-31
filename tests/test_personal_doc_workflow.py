@@ -1,11 +1,20 @@
+# ruff: noqa: E402
+
 from pathlib import Path
+import inspect
 import sys
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from shared.document_media import (
+    build_mistral_document_chunk,
+    get_document_content_type,
+)
 from shared.extraction_fields import (
     PERSONAL_DOCUMENT_CATEGORIES,
     PERSONAL_DOCUMENT_LABELS,
@@ -19,12 +28,62 @@ def test_personal_document_categories_are_defined():
         "passport",
         "proof_of_address",
         "gtc",
+        "other",
     ]
     assert PERSONAL_DOCUMENT_LABELS["id"] == "🆔 ID"
     assert PERSONAL_DOCUMENT_LABELS["passport"] == "🛂 Passport"
     assert PERSONAL_DOCUMENT_LABELS["proof_of_address"] == "🏠 Proof of Address"
     assert PERSONAL_DOCUMENT_LABELS["gtc"] == "📜 GTC"
+    assert PERSONAL_DOCUMENT_LABELS["other"] == "❓ Other"
 
 
 def test_personal_document_workflow_is_registered():
     assert PersonalDocumentWorkflow.__name__ == "PersonalDocumentWorkflow"
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("document.PDF", "application/pdf"),
+        ("scan.jpg", "image/jpeg"),
+        ("scan.JPEG", "image/jpeg"),
+        ("scan.PnG", "image/png"),
+        ("scan.WEBP", "image/webp"),
+    ],
+)
+def test_document_content_type_is_detected_case_insensitively(filename, expected):
+    assert get_document_content_type(filename) == expected
+
+
+def test_unsupported_document_format_is_rejected():
+    with pytest.raises(ValueError, match="Unsupported document format"):
+        get_document_content_type("passport.heic")
+
+
+def test_pdf_uses_document_url_chunk():
+    assert build_mistral_document_chunk(
+        "https://example.test/document",
+        "passport.pdf",
+        "application/pdf",
+    ) == {
+        "type": "document_url",
+        "document_url": "https://example.test/document",
+        "document_name": "passport.pdf",
+    }
+
+
+@pytest.mark.parametrize("content_type", ["image/jpeg", "image/png", "image/webp"])
+def test_image_uses_image_url_chunk(content_type):
+    assert build_mistral_document_chunk(
+        "https://example.test/image",
+        "identity-image",
+        content_type,
+    ) == {
+        "type": "image_url",
+        "image_url": "https://example.test/image",
+    }
+
+
+def test_personal_document_workflow_defaults_to_pdf_content_type():
+    parameter = inspect.signature(PersonalDocumentWorkflow.run).parameters["content_type"]
+    assert parameter.default == "application/pdf"

@@ -10,6 +10,7 @@ import mistralai.workflows.plugins.mistralai as workflows_mistralai
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, create_model
 
+from shared.document_media import build_mistral_document_chunk
 from shared.extraction_fields import (
     PERSONAL_COMMON_FIELDS,
     PERSONAL_DOCUMENT_CATEGORIES,
@@ -60,7 +61,7 @@ async def get_personal_document_signed_url(file_id: str) -> str:
 
 
 @workflows.activity(start_to_close_timeout=timedelta(minutes=2), retry_policy_max_attempts=2)
-async def classify_personal_document(document_url: str, filename: str) -> dict:
+async def classify_personal_document(document_content: dict[str, str], filename: str) -> dict:
     client = workflows_mistralai.get_mistral_client()
     model = os.environ.get("MISTRAL_CLASSIFIER_MODEL", "mistral-medium-latest")
     response = await client.chat.parse_async(
@@ -87,11 +88,7 @@ async def classify_personal_document(document_url: str, filename: str) -> dict:
                             "Return confidence between 0 and 1 and a short explanation."
                         ),
                     },
-                    {
-                        "type": "document_url",
-                        "document_url": document_url,
-                        "document_name": filename,
-                    },
+                    document_content,
                 ],
             },
         ],
@@ -103,7 +100,11 @@ async def classify_personal_document(document_url: str, filename: str) -> dict:
 
 
 @workflows.activity(start_to_close_timeout=timedelta(minutes=2), retry_policy_max_attempts=2)
-async def extract_personal_document_info(document_url: str, filename: str, category: str) -> dict:
+async def extract_personal_document_info(
+    document_content: dict[str, str],
+    filename: str,
+    category: str,
+) -> dict:
     client = workflows_mistralai.get_mistral_client()
     model = os.environ.get("MISTRAL_EXTRACTOR_MODEL", "mistral-medium-latest")
     extraction_model = get_personal_extraction_output_model(category)
@@ -136,11 +137,7 @@ async def extract_personal_document_info(document_url: str, filename: str, categ
                             "Return null for missing values."
                         ),
                     },
-                    {
-                        "type": "document_url",
-                        "document_url": document_url,
-                        "document_name": filename,
-                    },
+                    document_content,
                 ],
             },
         ],
@@ -176,6 +173,7 @@ class PersonalDocumentWorkflow(workflows.InteractiveWorkflow):
         filename: str,
         confidence_threshold: float = 0.9,
         manual_review_timeout_seconds: Optional[float] = None,
+        content_type: str = "application/pdf",
     ) -> workflows_mistralai.ChatAssistantWorkflowOutput:
         ocr_item = workflows_mistralai.TodoListItem(
             title="Prepare personal document for Document QnA",
@@ -194,6 +192,11 @@ class PersonalDocumentWorkflow(workflows.InteractiveWorkflow):
             self.steps["ocr"]["status"] = "running"
             async with ocr_item:
                 signed_document_url = await get_personal_document_signed_url(file_id)
+                document_content = build_mistral_document_chunk(
+                    signed_document_url,
+                    filename,
+                    content_type,
+                )
             self.steps["ocr"] = {
                 "status": "done",
                 "result": "Document prepared for Document QnA (OCR handled by Mistral Document AI).",
@@ -201,7 +204,7 @@ class PersonalDocumentWorkflow(workflows.InteractiveWorkflow):
 
             self.steps["classify"]["status"] = "running"
             async with classify_item:
-                classification = await classify_personal_document(signed_document_url, filename)
+                classification = await classify_personal_document(document_content, filename)
 
                 if classification.get("confidence", 0.0) < confidence_threshold:
                     self.steps["classify"] = {"status": "waiting_human", "result": classification}
@@ -226,7 +229,7 @@ class PersonalDocumentWorkflow(workflows.InteractiveWorkflow):
             self.steps["extract"]["status"] = "running"
             async with extract_item:
                 extracted_info = await extract_personal_document_info(
-                    signed_document_url,
+                    document_content,
                     filename,
                     classification["category"],
                 )

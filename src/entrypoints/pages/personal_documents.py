@@ -16,11 +16,15 @@ try:
 except ImportError:
     fitz = None
 
-load_dotenv(override=True)
-
 from mistralai.client import Mistral
 from mistralai.workflows.client import get_mistral_client
+from shared.document_media import (
+    SUPPORTED_DOCUMENT_EXTENSIONS,
+    get_document_content_type,
+)
 from shared.extraction_fields import PERSONAL_DOCUMENT_LABELS
+
+load_dotenv(override=True)
 
 API_KEY = os.environ["MISTRAL_API_KEY"]
 BASE_URL = os.environ.get("SERVER_URL", "https://api.mistral.ai")
@@ -46,6 +50,7 @@ class PersonalDocumentInput(BaseModel):
     file_id: str
     filename: str
     confidence_threshold: float = 0.9
+    content_type: str = "application/pdf"
 
 
 class ManualCategorySignal(BaseModel):
@@ -68,16 +73,21 @@ def run_async(coro):
         loop.close()
 
 
-async def upload_pdf(pdf_bytes: bytes, filename: str) -> str:
+async def upload_document(document_bytes: bytes, filename: str, content_type: str) -> str:
     async with Mistral(api_key=API_KEY) as client:
         resp = await client.files.upload_async(
-            file={"file_name": filename, "content": pdf_bytes, "content_type": "application/pdf"},
+            file={"file_name": filename, "content": document_bytes, "content_type": content_type},
             purpose="ocr",
         )
     return resp.id
 
 
-async def trigger_workflow(file_id: str, filename: str, confidence_threshold: float) -> str:
+async def trigger_workflow(
+    file_id: str,
+    filename: str,
+    confidence_threshold: float,
+    content_type: str,
+) -> str:
     execution_id = f"personal-doc-{uuid.uuid4().hex[:12]}"
     async with get_workflows_client() as client:
         resp = await client.workflows.execute_workflow_async(
@@ -86,6 +96,7 @@ async def trigger_workflow(file_id: str, filename: str, confidence_threshold: fl
                 file_id=file_id,
                 filename=filename,
                 confidence_threshold=confidence_threshold,
+                content_type=content_type,
             ).model_dump(mode="json"),
             execution_id=execution_id,
         )
@@ -139,11 +150,13 @@ def backfill_steps_from_execution_result(steps: dict, result: object) -> dict:
     return updated
 
 
-def get_pdf_first_page(pdf_bytes: bytes):
-    if not fitz:
+def get_document_preview(document_bytes: bytes, content_type: str):
+    if content_type.startswith("image/"):
+        return document_bytes
+    if content_type != "application/pdf" or not fitz:
         return None
     try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        doc = fitz.open(stream=document_bytes, filetype="pdf")
         page = doc[0]
         pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
         img_bytes = pix.tobytes("ppm")
@@ -250,7 +263,10 @@ if "poll_error" not in st.session_state:
 if "signal_sent" not in st.session_state:
     st.session_state.signal_sent = False
 
-uploaded = st.file_uploader("Choose a PDF file", type=["pdf"])
+uploaded = st.file_uploader(
+    "Choose a PDF or image file",
+    type=list(SUPPORTED_DOCUMENT_EXTENSIONS),
+)
 
 if uploaded is not None:
     st.info(f"**{uploaded.name}** — {uploaded.size / 1024:.1f} KB")
@@ -262,14 +278,17 @@ if uploaded is not None:
         st.session_state.poll_error = None
         st.session_state.signal_sent = False
 
-        pdf_bytes = uploaded.read()
+        document_bytes = uploaded.read()
         filename = uploaded.name
+        content_type = get_document_content_type(filename)
 
-        with st.status("Uploading PDF…", expanded=False) as s:
-            file_id = run_async(upload_pdf(pdf_bytes, filename))
+        with st.status("Uploading document…", expanded=False) as s:
+            file_id = run_async(upload_document(document_bytes, filename, content_type))
             s.update(label="Upload ✓", state="complete")
 
-        execution_id = run_async(trigger_workflow(file_id, filename, confidence_threshold))
+        execution_id = run_async(
+            trigger_workflow(file_id, filename, confidence_threshold, content_type)
+        )
         st.session_state.execution_id = execution_id
         st.rerun()
 
@@ -284,18 +303,19 @@ if st.session_state.execution_id and not st.session_state.done:
         steps = st.session_state.steps
         st.session_state.poll_error = str(exc)
 
-    col_pdf, col_steps = st.columns([1, 1.2])
+    col_document, col_steps = st.columns([1, 1.2])
 
-    with col_pdf:
+    with col_document:
         st.markdown("### 📄 Document")
         if uploaded:
-            pdf_bytes = uploaded.read()
+            document_bytes = uploaded.read()
             uploaded.seek(0)
-            img = get_pdf_first_page(pdf_bytes)
-            if img:
-                st.image(img, width="stretch")
+            content_type = get_document_content_type(uploaded.name)
+            preview = get_document_preview(document_bytes, content_type)
+            if preview:
+                st.image(preview, width="stretch")
             else:
-                st.info("PyMuPDF not available for preview")
+                st.info("Preview is unavailable for this document.")
 
     with col_steps:
         if st.session_state.poll_error:

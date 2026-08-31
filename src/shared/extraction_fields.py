@@ -142,6 +142,7 @@ PERSONAL_DOCUMENT_SPECIFIC_FIELDS: dict[str, list[tuple[str, str]]] = {
         ("key_clauses", "Main clauses or obligations described"),
         ("acceptance_text", "Any acceptance or acknowledgment wording"),
     ],
+    "other": [],
 }
 
 PERSONAL_DOCUMENT_CATEGORIES: list[str] = list(PERSONAL_DOCUMENT_SPECIFIC_FIELDS.keys())
@@ -151,4 +152,5 @@ PERSONAL_DOCUMENT_LABELS: dict[str, str] = {
     "passport": "🛂 Passport",
     "proof_of_address": "🏠 Proof of Address",
     "gtc": "📜 GTC",
+    "other": "❓ Other",
 }
