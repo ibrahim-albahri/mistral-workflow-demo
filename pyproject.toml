@@ -1,0 +1,20 @@
+[project]
+name = "invoice-processor"
+version = "0.1.0"
+description = "A Mistral Workflows project"
+requires-python = ">=3.12"
+dependencies = [
+    "mistralai-workflows[mistralai]>=3.0.0,<4",
+    "pydantic",
+    "python-dotenv",
+    "streamlit==1.55.0",
+    "pymupdf>=1.23.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.11",
+    "mypy>=1.15",
+    "pytest>=8.0",
+    "watchdog>=4.0",
+]
