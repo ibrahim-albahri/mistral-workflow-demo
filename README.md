@@ -1,67 +1,49 @@
-# OCR-driven document processing for healthcare
+# Personal document processor
 
-A [Mistral Workflows](https://docs.mistral.ai/workflows/getting-started/introduction) project.
+A [Mistral Workflows](https://docs.mistral.ai/workflows/getting-started/introduction) demo for classifying and extracting information from personal documents.
 
-This project shows how to use Mistral Workflows to process documents in healthcare.
+The `personal_document_workflow` supports IDs, passports, proofs of address, general terms and conditions (GTC), and uncategorized documents. It accepts PDFs plus JPEG, PNG, and WebP images.
 
 ## Setup
 
-Run the following command to install the required project dependencies:
+Install the project dependencies:
 
 ```bash
 make installdeps
 ```
 
-Then copy `.env.example` to `.env` and set your `MISTRAL_API_KEY`.
-You can optionally override the chat completion models via
-`MISTRAL_CLASSIFIER_MODEL` and `MISTRAL_EXTRACTOR_MODEL`.
+Then copy `.env.example` to `.env` and set `MISTRAL_API_KEY`. You can optionally override the chat completion models via `MISTRAL_CLASSIFIER_MODEL` and `MISTRAL_EXTRACTOR_MODEL`.
 
-## Commands
+## Run the workflow worker
 
-### Register workflows in AI Studio
-
-Use the following command to auto-discoves all workflow classes in `src/workflows/`, register them with AI Studio, and starts polling for executions. The task deployent name is set to your hostname:
+Register the workflow with AI Studio and poll for executions:
 
 ```bash
 make start-worker
 ```
 
-### Execute the workflow
+The worker auto-discovers workflow classes in `src/workflows/`; this project registers `personal_document_workflow`.
 
-In a separate terminal, start the Streamlit app to view the document extraction UI:
+## Run the UI
+
+In a separate terminal, start the Streamlit interface:
 
 ```bash
 make streamlit
 ```
 
-Upload one of the provided PDFs and click "Start Workflow".
+Upload a supported document and click **Start Workflow**. The UI shows document preparation, classification, and extracted fields, including MRZ validation when available.
 
-You can monitor your workflow's progress and view the extracted data in [AI Studio](https://console.mistral.ai/build/workflows/).
-
-### Load test
-
-The following command runs a load test that triggers the workflow 10 times using the provided input documents:
-
-```bash
-make load-test
-```
-
-You can also provide a custom amount of times to trigger the workflow:
-
-```bash
-make load-test n=5
-```
+You can monitor execution progress and extracted data in [AI Studio](https://console.mistral.ai/build/workflows/).
 
 ## Development
 
 ```bash
-# Format
 uv run ruff format .
-
-# Lint
 uv run ruff check --fix .
+uv run pytest
 ```
 
 ## Clean up
 
-When you're done, stop the Streamlit app and the worker using `Ctrl+C`.
+When finished, stop the Streamlit app and worker with `Ctrl+C`.

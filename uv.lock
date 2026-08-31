@@ -444,7 +444,7 @@ wheels = [
 ]
 
 [[package]]
-name = "invoice-processor"
+name = "personal-document-processor"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
