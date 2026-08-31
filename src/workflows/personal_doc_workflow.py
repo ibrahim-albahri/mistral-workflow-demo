@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from datetime import timedelta
@@ -255,7 +256,12 @@ async def extract_personal_document_info(
     )
     if parsed is None:
         raise RuntimeError("Personal document extraction response could not be parsed.")
-    return enrich_with_mrz_fallback(parsed.model_dump(mode="json"), category)
+    extracted_info = enrich_with_mrz_fallback(parsed.model_dump(mode="json"), category)
+    print(
+        "Personal document extraction result "
+        f"for {filename}: {json.dumps(extracted_info, ensure_ascii=False, sort_keys=True)}"
+    )
+    return extracted_info
 
 
 @workflows.workflow.define(name="personal_document_workflow")

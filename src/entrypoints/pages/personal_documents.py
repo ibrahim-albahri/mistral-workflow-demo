@@ -7,6 +7,7 @@ import io
 import os
 import time
 import uuid
+from typing import Any
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -25,6 +26,7 @@ from shared.document_media import (
 )
 from shared.extraction_display import format_extraction_value
 from shared.extraction_fields import PERSONAL_DOCUMENT_LABELS
+from shared.workflow_results import workflow_result_mapping, workflow_status_name
 
 load_dotenv(override=True)
 
@@ -136,15 +138,16 @@ async def send_signal(execution_id: str, category: str):
         )
 
 
-def backfill_steps_from_execution_result(steps: dict, result: object) -> dict:
-    if not isinstance(result, dict):
+def backfill_steps_from_execution_result(steps: dict, result: Any) -> dict:
+    result_mapping = workflow_result_mapping(result)
+    if not result_mapping:
         return steps
 
-    structured = result.get("structuredContent")
+    structured = result_mapping.get("structuredContent")
     if not isinstance(structured, dict):
-        structured = result.get("structured_content")
+        structured = result_mapping.get("structured_content")
     if not isinstance(structured, dict):
-        structured = result
+        structured = result_mapping
 
     ocr_text = structured.get("ocr_text")
     classification = structured.get("classification")
@@ -364,7 +367,7 @@ if st.session_state.execution_id and not st.session_state.done:
     else:
         try:
             execution = run_async(get_execution_details(execution_id))
-            wf_status = execution.status
+            wf_status = workflow_status_name(execution.status)
             if wf_status == "COMPLETED":
                 st.session_state.steps = backfill_steps_from_execution_result(
                     st.session_state.steps,
@@ -372,6 +375,7 @@ if st.session_state.execution_id and not st.session_state.done:
                 )
                 st.session_state.done = True
                 st.success("✅ Completed!")
+                st.rerun()
             elif wf_status in ("FAILED", "CANCELED", "TERMINATED"):
                 st.error(f"Workflow ended with status: {wf_status}")
                 st.session_state.done = True

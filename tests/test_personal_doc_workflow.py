@@ -7,6 +7,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -23,6 +24,7 @@ from shared.extraction_fields import (
     PERSONAL_DOCUMENT_LABELS,
 )
 from shared.mrz import parse_mrz
+from shared.workflow_results import workflow_result_mapping, workflow_status_name
 from workflows import personal_doc_workflow
 from workflows.personal_doc_workflow import (
     PersonalDocumentClassification,
@@ -191,7 +193,7 @@ def test_mrz_fills_only_missing_visual_fields_and_records_disagreements():
     assert result["specific"]["mrz"]["disagreements"]
 
 
-def test_extraction_prompt_includes_visual_first_rules(monkeypatch):
+def test_extraction_prompt_includes_visual_first_rules(monkeypatch, capsys):
     captured = {}
 
     class FakeClient:
@@ -224,9 +226,33 @@ def test_extraction_prompt_includes_visual_first_rules(monkeypatch):
     assert result["common"]["full_name"] is None
     assert "visibly printed fields as the source of truth" in system_text
     assert "holder_signature: Whether the holder signature is present" in user_text
+    assert "Personal document extraction result for scan.pdf" in capsys.readouterr().out
 
 
 def test_typed_values_have_table_safe_display_values():
     assert format_extraction_value(True) == "Yes"
     assert format_extraction_value(["A", "B"]) == "A, B"
     assert '"format": "TD3"' in format_extraction_value({"format": "TD3"})
+
+
+def test_workflow_results_support_json_and_sdk_model_shapes():
+    class FakeResult(BaseModel):
+        structured_content: dict
+
+    payload = {"structuredContent": {"personal_document_info": {"common": {}}}}
+    assert workflow_result_mapping(payload) == payload
+    assert workflow_result_mapping('{"structuredContent": {}}') == {
+        "structuredContent": {}
+    }
+    assert workflow_result_mapping(FakeResult(structured_content={"ok": True})) == {
+        "structured_content": {"ok": True}
+    }
+    assert workflow_result_mapping("not json") == {}
+
+
+def test_workflow_status_name_supports_enum_like_values():
+    class Status:
+        value = "COMPLETED"
+
+    assert workflow_status_name(Status()) == "COMPLETED"
+    assert workflow_status_name("WorkflowStatus.FAILED") == "FAILED"
