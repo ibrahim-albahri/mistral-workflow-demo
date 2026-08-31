@@ -81,7 +81,7 @@ async def trigger_workflow(file_id: str, filename: str, confidence_threshold: fl
     execution_id = f"personal-doc-{uuid.uuid4().hex[:12]}"
     async with get_workflows_client() as client:
         resp = await client.workflows.execute_workflow_async(
-            workflow_identifier="pdf_ocr_workflow",
+            workflow_identifier="personal_document_workflow",
             input=PersonalDocumentInput(
                 file_id=file_id,
                 filename=filename,
