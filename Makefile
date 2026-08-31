@@ -16,7 +16,3 @@ execute:
 ## Start the Streamlit app
 streamlit:
 	PYTHONPATH=src uv run streamlit run src/entrypoints/app.py
-
-## Run load test
-load-test:
-	uv run python src/entrypoints/load_test.py $(if $(n),$(n),)
