@@ -119,7 +119,7 @@ PERSONAL_DOCUMENT_SPECIFIC_FIELDS: dict[str, list[tuple[str, str]]] = {
         ("document_type", "Type of identification document"),
         ("place_of_birth", "Place of birth"),
         ("sex", "Sex or gender field if present"),
-        ("mrz", "Machine-readable zone data or encoded identifier"),
+        ("mrz", "Machine-readable zone lines, transcribed exactly when visible"),
     ],
     "passport": [
         ("passport_number", "Passport number"),
@@ -127,6 +127,7 @@ PERSONAL_DOCUMENT_SPECIFIC_FIELDS: dict[str, list[tuple[str, str]]] = {
         ("place_of_birth", "Place of birth"),
         ("passport_type", "Type of passport or travel document"),
         ("holder_signature", "Whether the holder signature is present"),
+        ("mrz", "Machine-readable zone lines, transcribed exactly when visible"),
     ],
     "proof_of_address": [
         ("provider_name", "Name of the service provider or issuer"),
@@ -153,4 +154,11 @@ PERSONAL_DOCUMENT_LABELS: dict[str, str] = {
     "proof_of_address": "🏠 Proof of Address",
     "gtc": "📜 GTC",
     "other": "❓ Other",
+}
+
+# Fields with a value type other than the default optional string.  The
+# extraction workflow uses these values when it builds its Pydantic schema.
+PERSONAL_FIELD_TYPES: dict[str, type] = {
+    "holder_signature": bool,
+    "key_clauses": list[str],
 }

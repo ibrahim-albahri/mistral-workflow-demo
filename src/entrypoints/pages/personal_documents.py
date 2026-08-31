@@ -1,6 +1,7 @@
 """
 Streamlit page for personal documents: ID / Passport / Proof of Address / GTC.
 """
+
 import asyncio
 import io
 import os
@@ -22,6 +23,7 @@ from shared.document_media import (
     SUPPORTED_DOCUMENT_EXTENSIONS,
     get_document_content_type,
 )
+from shared.extraction_display import format_extraction_value
 from shared.extraction_fields import PERSONAL_DOCUMENT_LABELS
 
 load_dotenv(override=True)
@@ -73,10 +75,16 @@ def run_async(coro):
         loop.close()
 
 
-async def upload_document(document_bytes: bytes, filename: str, content_type: str) -> str:
+async def upload_document(
+    document_bytes: bytes, filename: str, content_type: str
+) -> str:
     async with Mistral(api_key=API_KEY) as client:
         resp = await client.files.upload_async(
-            file={"file_name": filename, "content": document_bytes, "content_type": content_type},
+            file={
+                "file_name": filename,
+                "content": document_bytes,
+                "content_type": content_type,
+            },
             purpose="ocr",
         )
     return resp.id
@@ -114,7 +122,9 @@ async def poll_steps(execution_id: str) -> dict:
 
 async def get_execution_details(execution_id: str):
     async with get_workflows_client() as client:
-        return await client.workflows.executions.get_workflow_execution_async(execution_id=execution_id)
+        return await client.workflows.executions.get_workflow_execution_async(
+            execution_id=execution_id
+        )
 
 
 async def send_signal(execution_id: str, category: str):
@@ -210,7 +220,10 @@ def render_step(key: str, step: dict):
 
             st.markdown("**🧍 Common Information**")
             common_rows = [
-                {"Field": COMMON_FIELD_LABELS.get(k, k), "Value": ", ".join(v) if isinstance(v, list) else v}
+                {
+                    "Field": COMMON_FIELD_LABELS.get(k, k),
+                    "Value": format_extraction_value(v),
+                }
                 for k, v in common.items()
                 if v is not None
             ]
@@ -222,19 +235,29 @@ def render_step(key: str, step: dict):
             if specific:
                 st.markdown("**📋 Specific Information**")
                 specific_rows = [
-                    {"Field": k.replace("_", " ").capitalize(), "Value": ", ".join(v) if isinstance(v, list) else v}
+                    {
+                        "Field": k.replace("_", " ").capitalize(),
+                        "Value": format_extraction_value(v),
+                    }
                     for k, v in specific.items()
-                    if v is not None
+                    if v is not None and k != "mrz"
                 ]
                 if specific_rows:
                     st.table(specific_rows)
                 else:
                     st.info("No specific information found.")
 
+                mrz = specific.get("mrz")
+                if isinstance(mrz, dict):
+                    st.markdown("**MRZ validation**")
+                    st.json(mrz, expanded=False)
+
 
 st.set_page_config(page_title="Personal Documents", page_icon="🧾", layout="wide")
 st.title("🧾 Personal Documents")
-st.caption("Upload an ID, passport, proof of address, or GTC → OCR → Classification → Extraction")
+st.caption(
+    "Upload an ID, passport, proof of address, or GTC → OCR → Classification → Extraction"
+)
 
 with st.sidebar:
     st.header("⚙️ Parameters")
@@ -326,7 +349,9 @@ if st.session_state.execution_id and not st.session_state.done:
             render_step(key, step)
 
     all_done = all(steps.get(k, {}).get("status") == "done" for k, _ in STEPS_CONFIG)
-    waiting_human = any(steps.get(k, {}).get("status") == "waiting_human" for k, _ in STEPS_CONFIG)
+    waiting_human = any(
+        steps.get(k, {}).get("status") == "waiting_human" for k, _ in STEPS_CONFIG
+    )
 
     if all_done:
         st.session_state.done = True
