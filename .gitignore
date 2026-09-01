@@ -7,3 +7,5 @@ build/
 *.egg-info/
 .mypy_cache/
 .ruff_cache/
+worker-error.log
+worker.log
