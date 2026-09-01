@@ -3,7 +3,9 @@ Streamlit UI for personal documents: ID / Passport / Proof of Address / GTC.
 """
 
 import asyncio
+import csv
 import io
+import json
 import os
 import time
 import uuid
@@ -61,6 +63,23 @@ class ManualCategorySignal(BaseModel):
     category: str
 
 
+class BatchDocumentInput(BaseModel):
+    document_id: str
+    file_id: str
+    filename: str
+    content_type: str
+
+
+class BatchPersonalDocumentInput(BaseModel):
+    documents: list[BatchDocumentInput]
+    confidence_threshold: float = 0.9
+
+
+class BatchManualCategorySignal(BaseModel):
+    document_id: str
+    category: str
+
+
 def get_workflows_client():
     return get_mistral_client(
         server_url=BASE_URL,
@@ -113,11 +132,35 @@ async def trigger_workflow(
     return resp.execution_id
 
 
+async def trigger_batch_workflow(
+    documents: list[BatchDocumentInput], confidence_threshold: float
+) -> str:
+    execution_id = f"personal-doc-batch-{uuid.uuid4().hex[:12]}"
+    async with get_workflows_client() as client:
+        resp = await client.workflows.execute_workflow_async(
+            workflow_identifier="batch_personal_document_workflow",
+            input=BatchPersonalDocumentInput(
+                documents=documents, confidence_threshold=confidence_threshold
+            ).model_dump(mode="json"),
+            execution_id=execution_id,
+        )
+    return resp.execution_id
+
+
 async def poll_steps(execution_id: str) -> dict:
     async with get_workflows_client() as client:
         resp = await client.workflows.executions.query_workflow_execution_async(
             execution_id=execution_id,
             name="get_steps",
+        )
+    return resp.result or {}
+
+
+async def poll_batch_status(execution_id: str) -> dict:
+    async with get_workflows_client() as client:
+        resp = await client.workflows.executions.query_workflow_execution_async(
+            execution_id=execution_id,
+            name="get_batch_status",
         )
     return resp.result or {}
 
@@ -136,6 +179,57 @@ async def send_signal(execution_id: str, category: str):
             name="manual_category",
             input=ManualCategorySignal(category=category).model_dump(mode="json"),
         )
+
+
+async def send_batch_signal(execution_id: str, document_id: str, category: str):
+    async with get_workflows_client() as client:
+        await client.workflows.executions.signal_workflow_execution_async(
+            execution_id=execution_id,
+            name="manual_batch_category",
+            input=BatchManualCategorySignal(
+                document_id=document_id, category=category
+            ).model_dump(mode="json"),
+        )
+
+
+def batch_csv_bytes(documents: list[dict]) -> bytes:
+    """Return the compact, one-row-per-document batch export."""
+    output = io.StringIO(newline="")
+    fields = [
+        "document_id",
+        "filename",
+        "content_type",
+        "status",
+        "category",
+        "confidence",
+        "explanation",
+        *COMMON_FIELD_LABELS,
+        "specific_fields",
+        "error",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fields)
+    writer.writeheader()
+    for document in documents:
+        classification = document.get("classification") or {}
+        extraction = document.get("extraction") or {}
+        common = extraction.get("common") or {}
+        writer.writerow(
+            {
+                "document_id": document.get("document_id", ""),
+                "filename": document.get("filename", ""),
+                "content_type": document.get("content_type", ""),
+                "status": document.get("status", ""),
+                "category": classification.get("category", ""),
+                "confidence": classification.get("confidence", ""),
+                "explanation": classification.get("explanation", ""),
+                **{key: common.get(key, "") for key in COMMON_FIELD_LABELS},
+                "specific_fields": json.dumps(
+                    extraction.get("specific") or {}, ensure_ascii=False
+                ),
+                "error": document.get("error") or "",
+            }
+        )
+    return output.getvalue().encode("utf-8")
 
 
 def backfill_steps_from_execution_result(steps: dict, result: Any) -> dict:
@@ -288,6 +382,14 @@ if "poll_error" not in st.session_state:
     st.session_state.poll_error = None
 if "signal_sent" not in st.session_state:
     st.session_state.signal_sent = False
+if "batch_execution_id" not in st.session_state:
+    st.session_state.batch_execution_id = None
+if "batch_status" not in st.session_state:
+    st.session_state.batch_status = {}
+if "batch_done" not in st.session_state:
+    st.session_state.batch_done = False
+if "batch_error" not in st.session_state:
+    st.session_state.batch_error = None
 
 uploaded = st.file_uploader(
     "Choose a PDF or image file",
@@ -394,3 +496,139 @@ elif st.session_state.execution_id and st.session_state.done:
         step = steps.get(key, {"status": "pending", "result": None})
         render_step(key, step)
     st.success("✅ Completed!")
+
+
+st.divider()
+st.header("Batch processing")
+st.caption(
+    "Upload up to 100 documents. Mistral OCR runs first, followed by Batch API classification and extraction."
+)
+batch_uploads = st.file_uploader(
+    "Choose PDF or image files for a batch",
+    type=list(SUPPORTED_DOCUMENT_EXTENSIONS),
+    accept_multiple_files=True,
+    key="batch_file_uploader",
+)
+
+if len(batch_uploads or []) > 100:
+    st.error("A batch can contain at most 100 documents.")
+elif batch_uploads:
+    st.caption(f"{len(batch_uploads)} document(s) selected")
+    if st.button("Start Batch Workflow", type="primary"):
+        st.session_state.batch_execution_id = None
+        st.session_state.batch_status = {}
+        st.session_state.batch_done = False
+        st.session_state.batch_error = None
+        documents: list[BatchDocumentInput] = []
+        with st.status("Uploading batch documents…", expanded=True) as status:
+            for index, uploaded_batch_file in enumerate(batch_uploads, start=1):
+                filename = uploaded_batch_file.name
+                content_type = get_document_content_type(filename)
+                file_id = run_async(
+                    upload_document(
+                        uploaded_batch_file.getvalue(), filename, content_type
+                    )
+                )
+                documents.append(
+                    BatchDocumentInput(
+                        document_id=uuid.uuid4().hex,
+                        file_id=file_id,
+                        filename=filename,
+                        content_type=content_type,
+                    )
+                )
+                status.update(label=f"Uploaded {index}/{len(batch_uploads)} documents…")
+            status.update(label="Uploads complete", state="complete")
+        st.session_state.batch_execution_id = run_async(
+            trigger_batch_workflow(documents, confidence_threshold)
+        )
+        st.rerun()
+
+if st.session_state.batch_execution_id:
+    try:
+        batch_status = run_async(poll_batch_status(st.session_state.batch_execution_id))
+        st.session_state.batch_status = batch_status
+        st.session_state.batch_error = None
+    except Exception as exc:
+        batch_status = st.session_state.batch_status
+        st.session_state.batch_error = str(exc)
+
+    if st.session_state.batch_error:
+        st.warning(f"Batch progress polling failed: {st.session_state.batch_error}")
+
+    documents = batch_status.get("documents", [])
+    counts = batch_status.get("counts", {})
+    if counts:
+        st.caption(" · ".join(f"{status}: {count}" for status, count in counts.items()))
+    if documents:
+        table_rows = [
+            {
+                "Filename": document.get("filename"),
+                "Status": document.get("status"),
+                "Category": (document.get("classification") or {}).get("category"),
+                "Confidence": (document.get("classification") or {}).get("confidence"),
+                "Error": document.get("error"),
+            }
+            for document in documents
+        ]
+        st.dataframe(table_rows, width="stretch", hide_index=True)
+
+        awaiting_review = [
+            document
+            for document in documents
+            if document.get("status") == "awaiting_review"
+        ]
+        for document in awaiting_review:
+            with st.expander(
+                f"Review required: {document.get('filename')}", expanded=True
+            ):
+                classification = document.get("classification") or {}
+                st.warning(
+                    f"Model confidence: {classification.get('confidence', 0.0) * 100:.0f}%"
+                )
+                category = st.selectbox(
+                    "Category",
+                    options=list(PERSONAL_DOCUMENT_LABELS),
+                    format_func=lambda key: PERSONAL_DOCUMENT_LABELS[key],
+                    key=f"batch-category-{document['document_id']}",
+                )
+                if st.button(
+                    "Validate category", key=f"batch-submit-{document['document_id']}"
+                ):
+                    run_async(
+                        send_batch_signal(
+                            st.session_state.batch_execution_id,
+                            document["document_id"],
+                            category,
+                        )
+                    )
+                    st.rerun()
+
+        for document in documents:
+            extraction = document.get("extraction")
+            if extraction:
+                with st.expander(f"Extraction: {document.get('filename')}"):
+                    render_step("extract", {"status": "done", "result": extraction})
+
+        st.download_button(
+            "Download batch CSV",
+            data=batch_csv_bytes(documents),
+            file_name="personal-document-batch.csv",
+            mime="text/csv",
+        )
+
+    active_statuses = {
+        "ocr_pending",
+        "ocr_running",
+        "classification_running",
+        "queued_for_extraction",
+        "extracting",
+    }
+    if any(document.get("status") in active_statuses for document in documents):
+        time.sleep(1)
+        st.rerun()
+    elif documents and not any(
+        document.get("status") == "awaiting_review" for document in documents
+    ):
+        st.session_state.batch_done = True
+        st.success("Batch processing complete.")

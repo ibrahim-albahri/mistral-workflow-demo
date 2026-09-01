@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import asyncio
+import json
 import inspect
 import sys
 from types import SimpleNamespace
@@ -32,6 +33,17 @@ from workflows.personal_doc_workflow import (
     enrich_with_mrz_fallback,
     extract_personal_document_info,
     get_personal_extraction_output_model,
+)
+from workflows.batch_personal_doc_workflow import (
+    MAX_BATCH_DOCUMENTS,
+    BatchPersonalDocumentWorkflow,
+    batch_jsonl,
+    build_classification_batch_entries,
+    build_extraction_batch_entries,
+    build_ocr_batch_entries,
+    chat_json_from_body,
+    ocr_markdown_from_body,
+    parse_batch_result_rows,
 )
 
 
@@ -256,3 +268,57 @@ def test_workflow_status_name_supports_enum_like_values():
 
     assert workflow_status_name(Status()) == "COMPLETED"
     assert workflow_status_name("WorkflowStatus.FAILED") == "FAILED"
+
+
+def test_batch_workflow_is_registered_and_has_expected_limit():
+    assert BatchPersonalDocumentWorkflow.__name__ == "BatchPersonalDocumentWorkflow"
+    assert MAX_BATCH_DOCUMENTS == 100
+
+
+def test_batch_jsonl_and_result_rows_preserve_custom_ids():
+    payload = batch_jsonl([{"custom_id": "doc-1", "body": {"document": {}}}])
+    assert json.loads(payload.decode("utf-8"))["custom_id"] == "doc-1"
+    rows = parse_batch_result_rows(
+        '{"custom_id":"doc-1","response":{"body":{"pages":[{"markdown":"Hello"}]}}}\n'
+        '{"custom_id":"doc-2","error":{"message":"bad input"}}'
+    )
+    assert rows["doc-1"]["ok"] is True
+    assert rows["doc-2"] == {"ok": False, "error": "{'message': 'bad input'}"}
+
+
+def test_batch_requests_include_ocr_and_source_document():
+    document = {
+        "document_id": "doc-1",
+        "filename": "passport.pdf",
+        "content_type": "application/pdf",
+        "signed_url": "https://example.test/passport",
+        "ocr_markdown": "# Passport\nANNA ERIKSSON",
+        "classification": {"category": "passport"},
+    }
+    assert (
+        build_ocr_batch_entries([document])[0]["body"]["document"]["type"]
+        == "document_url"
+    )
+    assert (
+        "OCR markdown"
+        in build_classification_batch_entries([document])[0]["body"]["messages"][1][
+            "content"
+        ]
+    )
+    extraction_content = build_extraction_batch_entries([document])[0]["body"][
+        "messages"
+    ][1]["content"]
+    assert "OCR markdown" in extraction_content[0]["text"]
+    assert extraction_content[1]["document_url"] == "https://example.test/passport"
+
+
+def test_batch_ocr_and_chat_response_parsers():
+    assert (
+        ocr_markdown_from_body(
+            {"pages": [{"markdown": "first"}, {"markdown": "second"}]}
+        )
+        == "first\n\nsecond"
+    )
+    assert chat_json_from_body(
+        {"choices": [{"message": {"content": '{"category":"passport"}'}}]}
+    ) == {"category": "passport"}

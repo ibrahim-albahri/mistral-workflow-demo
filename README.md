@@ -34,6 +34,12 @@ make streamlit
 
 Upload a supported document and click **Start Workflow**. The UI shows document preparation, classification, and extracted fields, including MRZ validation when available.
 
+### Batch processing
+
+The **Batch processing** section accepts up to 100 PDFs or supported images. It runs Mistral OCR for every document, submits the OCR-backed classification and extraction stages through the Mistral Batch API, and shows status and errors for each document. Set `MISTRAL_OCR_MODEL` to override the default `mistral-ocr-latest` OCR model.
+
+Low-confidence classifications are presented for individual category review. Documents classified with sufficient confidence continue to extraction immediately; reviewed documents are submitted in subsequent extraction jobs. A batch completes with partial results when individual OCR, classification, or extraction requests fail, and the UI provides a one-row-per-document CSV export.
+
 You can monitor execution progress and extracted data in [AI Studio](https://console.mistral.ai/build/workflows/).
 
 ## Development
