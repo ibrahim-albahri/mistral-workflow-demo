@@ -28,6 +28,7 @@ from shared.document_media import (
 )
 from shared.extraction_display import format_extraction_value
 from shared.extraction_fields import PERSONAL_DOCUMENT_LABELS
+from shared.preprocessing import preprocess_image_bytes, upload_payload
 from shared.workflow_results import workflow_result_mapping, workflow_status_name
 
 load_dotenv(override=True)
@@ -390,6 +391,18 @@ if "batch_done" not in st.session_state:
     st.session_state.batch_done = False
 if "batch_error" not in st.session_state:
     st.session_state.batch_error = None
+if "single_upload_identity" not in st.session_state:
+    st.session_state.single_upload_identity = None
+if "single_enhanced_bytes" not in st.session_state:
+    st.session_state.single_enhanced_bytes = None
+if "single_enhancement_error" not in st.session_state:
+    st.session_state.single_enhancement_error = None
+if "batch_upload_identity" not in st.session_state:
+    st.session_state.batch_upload_identity = None
+if "batch_enhanced_bytes" not in st.session_state:
+    st.session_state.batch_enhanced_bytes = {}
+if "batch_enhancement_errors" not in st.session_state:
+    st.session_state.batch_enhancement_errors = {}
 
 uploaded = st.file_uploader(
     "Choose a PDF or image file",
@@ -399,6 +412,41 @@ uploaded = st.file_uploader(
 if uploaded is not None:
     st.info(f"**{uploaded.name}** — {uploaded.size / 1024:.1f} KB")
 
+    document_bytes = uploaded.getvalue()
+    filename = uploaded.name
+    content_type = get_document_content_type(filename)
+    upload_identity = (filename, uploaded.size)
+    if st.session_state.single_upload_identity != upload_identity:
+        st.session_state.single_upload_identity = upload_identity
+        st.session_state.single_enhanced_bytes = None
+        st.session_state.single_enhancement_error = None
+
+    if content_type.startswith("image/"):
+        if st.button("Enhance image", key="enhance_single_image"):
+            try:
+                st.session_state.single_enhanced_bytes = preprocess_image_bytes(
+                    document_bytes
+                )
+                st.session_state.single_enhancement_error = None
+            except (RuntimeError, ValueError) as exc:
+                st.session_state.single_enhanced_bytes = None
+                st.session_state.single_enhancement_error = str(exc)
+
+        if st.session_state.single_enhancement_error:
+            st.warning(
+                "Image enhancement failed; the original image will be uploaded. "
+                f"{st.session_state.single_enhancement_error}"
+            )
+        elif st.session_state.single_enhanced_bytes is not None:
+            st.success("Enhanced image ready. Start Workflow will use this PNG.")
+            original_preview, enhanced_preview = st.columns(2)
+            with original_preview:
+                st.caption("Original")
+                st.image(document_bytes, width="stretch")
+            with enhanced_preview:
+                st.caption("Enhanced")
+                st.image(st.session_state.single_enhanced_bytes, width="stretch")
+
     if st.button("Start Workflow", type="primary"):
         st.session_state.execution_id = None
         st.session_state.done = False
@@ -406,9 +454,12 @@ if uploaded is not None:
         st.session_state.poll_error = None
         st.session_state.signal_sent = False
 
-        document_bytes = uploaded.read()
-        filename = uploaded.name
-        content_type = get_document_content_type(filename)
+        document_bytes, filename, content_type = upload_payload(
+            document_bytes,
+            filename,
+            content_type,
+            st.session_state.single_enhanced_bytes,
+        )
 
         with st.status("Uploading document…", expanded=False) as s:
             file_id = run_async(upload_document(document_bytes, filename, content_type))
@@ -510,10 +561,63 @@ batch_uploads = st.file_uploader(
     key="batch_file_uploader",
 )
 
+batch_upload_identity = tuple(
+    (uploaded_file.name, uploaded_file.size) for uploaded_file in (batch_uploads or [])
+)
+if st.session_state.batch_upload_identity != batch_upload_identity:
+    st.session_state.batch_upload_identity = batch_upload_identity
+    st.session_state.batch_enhanced_bytes = {}
+    st.session_state.batch_enhancement_errors = {}
+
 if len(batch_uploads or []) > 100:
     st.error("A batch can contain at most 100 documents.")
 elif batch_uploads:
     st.caption(f"{len(batch_uploads)} document(s) selected")
+    image_uploads = [
+        uploaded_file
+        for uploaded_file in batch_uploads
+        if get_document_content_type(uploaded_file.name).startswith("image/")
+    ]
+    if image_uploads:
+        if st.button("Enhance batch images", key="enhance_batch_images"):
+            st.session_state.batch_enhanced_bytes = {}
+            st.session_state.batch_enhancement_errors = {}
+            for index, uploaded_batch_file in enumerate(batch_uploads):
+                content_type = get_document_content_type(uploaded_batch_file.name)
+                if not content_type.startswith("image/"):
+                    continue
+                try:
+                    st.session_state.batch_enhanced_bytes[index] = (
+                        preprocess_image_bytes(uploaded_batch_file.getvalue())
+                    )
+                except (RuntimeError, ValueError) as exc:
+                    st.session_state.batch_enhancement_errors[index] = str(exc)
+
+        if (
+            st.session_state.batch_enhanced_bytes
+            or st.session_state.batch_enhancement_errors
+        ):
+            with st.expander("Enhanced image previews", expanded=False):
+                for index, uploaded_batch_file in enumerate(batch_uploads):
+                    if not get_document_content_type(
+                        uploaded_batch_file.name
+                    ).startswith("image/"):
+                        continue
+                    error = st.session_state.batch_enhancement_errors.get(index)
+                    enhanced_bytes = st.session_state.batch_enhanced_bytes.get(index)
+                    if error:
+                        st.warning(
+                            f"{uploaded_batch_file.name}: enhancement failed; "
+                            f"the original will be uploaded. {error}"
+                        )
+                    elif enhanced_bytes is not None:
+                        st.caption(f"{uploaded_batch_file.name} -> enhanced PNG")
+                        original_preview, enhanced_preview = st.columns(2)
+                        with original_preview:
+                            st.image(uploaded_batch_file.getvalue(), width="stretch")
+                        with enhanced_preview:
+                            st.image(enhanced_bytes, width="stretch")
+
     if st.button("Start Batch Workflow", type="primary"):
         st.session_state.batch_execution_id = None
         st.session_state.batch_status = {}
@@ -522,12 +626,16 @@ elif batch_uploads:
         documents: list[BatchDocumentInput] = []
         with st.status("Uploading batch documents…", expanded=True) as status:
             for index, uploaded_batch_file in enumerate(batch_uploads, start=1):
-                filename = uploaded_batch_file.name
-                content_type = get_document_content_type(filename)
+                original_filename = uploaded_batch_file.name
+                original_content_type = get_document_content_type(original_filename)
+                document_bytes, filename, content_type = upload_payload(
+                    uploaded_batch_file.getvalue(),
+                    original_filename,
+                    original_content_type,
+                    st.session_state.batch_enhanced_bytes.get(index - 1),
+                )
                 file_id = run_async(
-                    upload_document(
-                        uploaded_batch_file.getvalue(), filename, content_type
-                    )
+                    upload_document(document_bytes, filename, content_type)
                 )
                 documents.append(
                     BatchDocumentInput(
