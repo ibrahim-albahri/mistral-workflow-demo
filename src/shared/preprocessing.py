@@ -35,13 +35,20 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Final, List, Optional, Tuple
 
 import cv2
 import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+PREPROCESSING_OPERATIONS: Final[tuple[str, ...]] = (
+    "sharpen", "exposure", "denoise", "orientation", "deskew", "perspective",
+    "margin_crop", "shadow_removal", "sauvola", "stamp_removal",
+    "table_grid_removal", "dpi_normalization",
+)
+MAX_PREVIEW_DIMENSION: Final[int] = 1024
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -116,6 +123,39 @@ def _load_bytes_as_bgr(image_bytes: bytes) -> np.ndarray:
     if arr.ndim == 2:
         return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+
+def image_quality_metrics(img: np.ndarray) -> dict[str, float | int | bool]:
+    """Return small, JSON-safe metrics used by the preprocessing agent."""
+    gray = _to_gray(img)
+    height, width = img.shape[:2]
+    return {
+        "width": width,
+        "height": height,
+        "blur_variance": round(_detect_blur(gray), 2),
+        "brightness": round(_mean_brightness(gray), 2),
+        "noise_estimate": round(_estimate_noise(gray), 2),
+        "table_regions": len(_detect_table_regions(img)),
+        "is_portrait": height >= width,
+    }
+
+
+def preview_image_bytes(image_bytes: bytes, max_dimension: int = MAX_PREVIEW_DIMENSION) -> bytes:
+    """Create a bounded PNG preview without changing the source artifact."""
+    img = _load_bytes_as_bgr(image_bytes)
+    height, width = img.shape[:2]
+    scale = min(1.0, max_dimension / max(height, width))
+    if scale < 1:
+        img = cv2.resize(img, (round(width * scale), round(height * scale)), interpolation=cv2.INTER_AREA)
+    ok, encoded = cv2.imencode(".png", img)
+    if not ok:
+        raise RuntimeError("Preview image could not be encoded as PNG.")
+    return encoded.tobytes()
+
+
+def inspect_image_bytes(image_bytes: bytes) -> dict[str, float | int | bool]:
+    """Decode an image and return its quality/layout metrics."""
+    return image_quality_metrics(_load_bytes_as_bgr(image_bytes))
 
 
 # ── Stage 2 — Quality Gate ────────────────────────────────────────────────────
@@ -427,6 +467,49 @@ def _normalise_dpi(img: np.ndarray, target_width: int = 2480) -> np.ndarray:
     return img
 
 
+def apply_preprocessing_operation(img: np.ndarray, operation: str) -> np.ndarray:
+    """Apply one named, deterministic preprocessing operation.
+
+    Parameters are deliberately fixed: the agent chooses *which* operation is
+    appropriate, while this module retains ownership of transformation details.
+    """
+    if operation not in PREPROCESSING_OPERATIONS:
+        raise ValueError(f"Unsupported preprocessing operation: {operation}")
+    if operation == "sharpen":
+        return _unsharp_mask(img)
+    if operation == "exposure":
+        brightness = _mean_brightness(_to_gray(img))
+        return _apply_clahe(img) if brightness < 128 else _apply_gamma(img, 0.7)
+    if operation == "denoise":
+        return _denoise(img)
+    if operation == "orientation":
+        return _coarse_orientation(img)
+    if operation == "deskew":
+        return _deskew(img)
+    if operation == "perspective":
+        return _perspective_correct(img)
+    if operation == "margin_crop":
+        return _margin_crop(img)
+    if operation == "shadow_removal":
+        return _shadow_removal(img)
+    if operation == "sauvola":
+        return _sauvola(img)
+    if operation == "stamp_removal":
+        return _stamp_suppression(img)
+    if operation == "table_grid_removal":
+        return _remove_table_gridlines(img, _detect_table_regions(img))
+    return _normalise_dpi(img)
+
+
+def apply_preprocessing_operation_bytes(image_bytes: bytes, operation: str) -> bytes:
+    """Apply one operation and return a PNG artifact suitable for upload."""
+    result = apply_preprocessing_operation(_load_bytes_as_bgr(image_bytes), operation)
+    ok, encoded = cv2.imencode(".png", result)
+    if not ok:
+        raise RuntimeError("Processed image could not be encoded as PNG.")
+    return encoded.tobytes()
+
+
 # ── Master pipeline ───────────────────────────────────────────────────────────
 
 
@@ -517,7 +600,10 @@ def conservative_ocr_config() -> PreprocessConfig:
 
 def enhanced_image_filename(filename: str) -> str:
     """Return a truthful PNG filename for an enhanced upload."""
-    return f"{Path(filename).stem}-enhanced.png"
+    stem = Path(filename).stem
+    while stem.endswith("-enhanced"):
+        stem = stem.removesuffix("-enhanced")
+    return f"{stem}-enhanced.png"
 
 
 def upload_payload(

@@ -33,6 +33,7 @@ from workflows.personal_doc_workflow import (
     enrich_with_mrz_fallback,
     extract_personal_document_info,
     get_personal_extraction_output_model,
+    validate_preprocessing_decision,
 )
 from workflows.batch_personal_doc_workflow import (
     MAX_BATCH_DOCUMENTS,
@@ -114,6 +115,29 @@ def test_personal_document_workflow_defaults_to_pdf_content_type():
         "content_type"
     ]
     assert parameter.default == "application/pdf"
+
+
+def test_preprocessing_decision_accepts_valid_agent_response():
+    decision = validate_preprocessing_decision(
+        '{"final_file_id":"processed-file","operations":["deskew","shadow_removal"],"rationale":"Text is tilted and unevenly lit."}',
+        "original-file",
+    )
+    assert decision.final_file_id == "processed-file"
+    assert decision.operations == ["deskew", "shadow_removal"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not json",
+        '{"final_file_id":"other-file","operations":[],"rationale":"x"}',
+        '{"final_file_id":"file","operations":["unknown"],"rationale":"x"}',
+        '{"final_file_id":"file","operations":["deskew","deskew"],"rationale":"x"}',
+    ],
+)
+def test_preprocessing_decision_rejects_invalid_agent_response(payload):
+    with pytest.raises((ValueError, json.JSONDecodeError)):
+        validate_preprocessing_decision(payload, "original-file")
 
 
 def test_personal_extraction_schema_preserves_descriptions_and_types():

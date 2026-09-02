@@ -5,7 +5,7 @@ import os
 from datetime import timedelta
 from enum import Enum
 from functools import lru_cache
-from typing import Optional
+from typing import Any, Optional
 
 import mistralai.workflows as workflows
 import mistralai.workflows.plugins.mistralai as workflows_mistralai
@@ -20,6 +20,13 @@ from shared.extraction_fields import (
     PERSONAL_FIELD_TYPES,
 )
 from shared.mrz import parse_mrz
+from shared.preprocessing import (
+    PREPROCESSING_OPERATIONS,
+    apply_preprocessing_operation_bytes,
+    enhanced_image_filename,
+    inspect_image_bytes,
+    preview_image_bytes,
+)
 
 load_dotenv(override=True)
 
@@ -45,6 +52,35 @@ class PersonalDocumentClassification(BaseModel):
     )
     confidence: float = Field(ge=0.0, le=1.0)
     explanation: str
+
+
+class PreprocessingDecision(BaseModel):
+    """Final, machine-validated output requested from the preprocessing agent."""
+
+    final_file_id: str
+    operations: list[str] = Field(default_factory=list)
+    rationale: str = Field(min_length=1)
+
+    def validate_operations(self) -> None:
+        unknown = set(self.operations) - set(PREPROCESSING_OPERATIONS)
+        if unknown:
+            raise ValueError(f"Unknown preprocessing operations: {sorted(unknown)}")
+        if len(self.operations) != len(set(self.operations)):
+            raise ValueError("A preprocessing operation may only be used once.")
+
+
+def validate_preprocessing_decision(
+    payload: str | dict[str, Any], original_file_id: str
+) -> PreprocessingDecision:
+    """Parse an agent response and protect the workflow from invalid plans."""
+    raw = json.loads(payload) if isinstance(payload, str) else payload
+    decision = PreprocessingDecision.model_validate(raw)
+    decision.validate_operations()
+    if not decision.final_file_id:
+        raise ValueError("The preprocessing decision has no final file ID.")
+    if not decision.operations and decision.final_file_id != original_file_id:
+        raise ValueError("A no-op decision must retain the original file ID.")
+    return decision
 
 
 class MrzExtraction(BaseModel):
@@ -144,6 +180,139 @@ async def get_personal_document_signed_url(file_id: str) -> str:
     client = workflows_mistralai.get_mistral_client()
     signed_url = await client.files.get_signed_url_async(file_id=file_id)
     return signed_url.url
+
+
+async def _download_image_file(file_id: str) -> bytes:
+    """Download a Mistral file inside an activity, never in workflow code."""
+    import httpx
+
+    client = workflows_mistralai.get_mistral_client()
+    signed_url = await client.files.get_signed_url_async(file_id=file_id)
+    async with httpx.AsyncClient(timeout=60) as http:
+        response = await http.get(signed_url.url)
+        response.raise_for_status()
+        return response.content
+
+
+async def _upload_processed_image(image_bytes: bytes, filename: str) -> str:
+    from mistralai.client import Mistral
+
+    async with Mistral(
+        api_key=os.environ["MISTRAL_API_KEY"],
+        server_url=os.environ.get("SERVER_URL", "https://api.mistral.ai"),
+    ) as client:
+        response = await client.files.upload_async(
+            file={
+                "file_name": filename,
+                "content": image_bytes,
+                "content_type": "image/png",
+            },
+            purpose="ocr",
+        )
+    return response.id
+
+
+@workflows.activity(
+    start_to_close_timeout=timedelta(minutes=2), retry_policy_max_attempts=2
+)
+async def inspect_preprocessing_image(file_id: str, filename: str) -> dict[str, Any]:
+    """Return metrics and a bounded preview file reference for an image artifact."""
+    image_bytes = await _download_image_file(file_id)
+    preview_id = await _upload_processed_image(
+        preview_image_bytes(image_bytes), f"{enhanced_image_filename(filename)}.preview.png"
+    )
+    client = workflows_mistralai.get_mistral_client()
+    preview_url = await client.files.get_signed_url_async(file_id=preview_id)
+    return {
+        "file_id": file_id,
+        "filename": filename,
+        "metrics": inspect_image_bytes(image_bytes),
+        "preview_file_id": preview_id,
+        "preview_url": preview_url.url,
+    }
+
+
+@workflows.activity(
+    start_to_close_timeout=timedelta(minutes=3), retry_policy_max_attempts=2
+)
+async def apply_preprocessing_tool(
+    source_file_id: str, source_filename: str, operation: str
+) -> dict[str, Any]:
+    """Apply one agent-selected operation and persist a replacement artifact."""
+    if operation not in PREPROCESSING_OPERATIONS:
+        raise ValueError(f"Unsupported preprocessing operation: {operation}")
+    source_bytes = await _download_image_file(source_file_id)
+    processed_bytes = apply_preprocessing_operation_bytes(source_bytes, operation)
+    filename = enhanced_image_filename(source_filename)
+    file_id = await _upload_processed_image(processed_bytes, filename)
+    preview_id = await _upload_processed_image(
+        preview_image_bytes(processed_bytes), f"{filename}.preview.png"
+    )
+    client = workflows_mistralai.get_mistral_client()
+    preview_url = await client.files.get_signed_url_async(file_id=preview_id)
+    return {
+        "file_id": file_id,
+        "filename": filename,
+        "content_type": "image/png",
+        "operation": operation,
+        "metrics": inspect_image_bytes(processed_bytes),
+        "preview_file_id": preview_id,
+        "preview_url": preview_url.url,
+    }
+
+
+def _agent_text(outputs: Any) -> str:
+    """Extract the final textual response across SDK output model versions."""
+    return "\n".join(
+        str(getattr(output, "text", ""))
+        for output in outputs
+        if getattr(output, "text", None)
+    ).strip()
+
+
+async def run_preprocessing_agent(file_id: str, filename: str) -> dict[str, Any]:
+    """Run the durable agent and return the selected persistent artifact."""
+    inspection = await inspect_preprocessing_image(file_id, filename)
+    agent = workflows_mistralai.Agent(
+        model=os.environ.get("MISTRAL_PREPROCESSING_AGENT_MODEL", "mistral-medium-latest"),
+        name="document-preprocessing-agent",
+        description="Selects image preprocessing operations for document OCR.",
+        instructions=(
+            "You optimize a document image for OCR. Inspect the supplied metrics and "
+            "preview URL, then call apply_preprocessing_tool only when justified. "
+            "Pass the latest file_id and filename to every tool. Never use an operation "
+            "more than once. Inspect each tool result before another operation. Return "
+            "ONLY JSON: {final_file_id, operations, rationale}. Use the original file_id "
+            "and an empty operations list when no transformation is needed."
+        ),
+        tools=[apply_preprocessing_tool],
+    )
+    outputs = await workflows_mistralai.Runner.run(
+        agent=agent,
+        inputs=[
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {key: value for key, value in inspection.items() if key != "preview_url"}
+                ),
+            },
+            {"type": "image_url", "image_url": inspection["preview_url"]},
+        ],
+        session=workflows_mistralai.RemoteSession(),
+        max_turns=14,
+    )
+    decision = validate_preprocessing_decision(_agent_text(outputs), file_id)
+    return {
+        "status": "done",
+        "file_id": decision.final_file_id,
+        "filename": enhanced_image_filename(filename)
+        if decision.operations
+        else filename,
+        "content_type": "image/png" if decision.operations else None,
+        "operations": decision.operations,
+        "rationale": decision.rationale,
+        "metrics": inspection["metrics"],
+    }
 
 
 @workflows.activity(
@@ -268,6 +437,7 @@ async def extract_personal_document_info(
 class PersonalDocumentWorkflow(workflows.InteractiveWorkflow):
     def __init__(self):
         self.steps = {
+            "preprocess": {"status": "pending", "result": None},
             "ocr": {"status": "pending", "result": None},
             "classify": {"status": "pending", "result": None},
             "extract": {"status": "pending", "result": None},
@@ -291,6 +461,10 @@ class PersonalDocumentWorkflow(workflows.InteractiveWorkflow):
         manual_review_timeout_seconds: Optional[float] = None,
         content_type: str = "application/pdf",
     ) -> workflows_mistralai.ChatAssistantWorkflowOutput:
+        preprocess_item = workflows_mistralai.TodoListItem(
+            title="Adaptively preprocess image",
+            description="Use an agent to select only the image improvements needed for OCR.",
+        )
         ocr_item = workflows_mistralai.TodoListItem(
             title="Prepare personal document for Document QnA",
             description="Generate a signed URL so Mistral Document AI can read the document.",
@@ -305,15 +479,50 @@ class PersonalDocumentWorkflow(workflows.InteractiveWorkflow):
         )
 
         async with workflows_mistralai.TodoList(
-            items=[ocr_item, classify_item, extract_item]
+            items=[preprocess_item, ocr_item, classify_item, extract_item]
         ):
+            processed_file_id = file_id
+            processed_filename = filename
+            processed_content_type = content_type
+            preprocessing_result: dict[str, Any]
+            if content_type.startswith("image/"):
+                self.steps["preprocess"]["status"] = "running"
+                async with preprocess_item:
+                    try:
+                        preprocessing_result = await run_preprocessing_agent(file_id, filename)
+                    except Exception as exc:
+                        preprocessing_result = {
+                            "status": "skipped",
+                            "file_id": file_id,
+                            "filename": filename,
+                            "content_type": content_type,
+                            "operations": [],
+                            "error": str(exc),
+                        }
+                    else:
+                        processed_file_id = preprocessing_result["file_id"]
+                        processed_filename = preprocessing_result["filename"]
+                        processed_content_type = preprocessing_result["content_type"] or content_type
+                self.steps["preprocess"] = {
+                    "status": "done",
+                    "result": preprocessing_result,
+                }
+            else:
+                preprocessing_result = {
+                    "status": "skipped",
+                    "file_id": file_id,
+                    "filename": filename,
+                    "content_type": content_type,
+                    "operations": [],
+                    "reason": "Preprocessing is currently supported for images only.",
+                }
+                self.steps["preprocess"] = {"status": "done", "result": preprocessing_result}
+
             self.steps["ocr"]["status"] = "running"
             async with ocr_item:
-                signed_document_url = await get_personal_document_signed_url(file_id)
+                signed_document_url = await get_personal_document_signed_url(processed_file_id)
                 document_content = build_mistral_document_chunk(
-                    signed_document_url,
-                    filename,
-                    content_type,
+                    signed_document_url, processed_filename, processed_content_type
                 )
             self.steps["ocr"] = {
                 "status": "done",
@@ -368,6 +577,7 @@ class PersonalDocumentWorkflow(workflows.InteractiveWorkflow):
             ],
             structuredContent={
                 "filename": filename,
+                "preprocessing": preprocessing_result,
                 "ocr_text": "Document processed with Document QnA (no standalone OCR text payload).",
                 "classification": classification,
                 "personal_document_info": extracted_info,

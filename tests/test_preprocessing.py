@@ -14,8 +14,12 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from shared.preprocessing import (
+    PREPROCESSING_OPERATIONS,
+    apply_preprocessing_operation_bytes,
     conservative_ocr_config,
     enhanced_image_filename,
+    inspect_image_bytes,
+    preview_image_bytes,
     preprocess_image_bytes,
     upload_payload,
 )
@@ -76,3 +80,23 @@ def test_upload_payload_uses_enhanced_png_only_when_available():
         "application/pdf",
     )
     assert enhanced_image_filename("archive.scan.JPEG") == "archive.scan-enhanced.png"
+    assert enhanced_image_filename("archive.scan-enhanced.png") == "archive.scan-enhanced.png"
+
+
+def test_agent_preprocessing_operations_produce_valid_pngs():
+    source = image_bytes("RGB")
+    for operation in set(PREPROCESSING_OPERATIONS) - {"sauvola"}:
+        output = apply_preprocessing_operation_bytes(source, operation)
+        with Image.open(io.BytesIO(output)) as image:
+            assert image.format == "PNG"
+
+
+def test_image_inspection_and_preview_are_json_safe_and_bounded():
+    source = image_bytes("RGB")
+    metrics = inspect_image_bytes(source)
+    preview = preview_image_bytes(source, max_dimension=16)
+
+    assert metrics["width"] == 32
+    assert metrics["height"] == 24
+    with Image.open(io.BytesIO(preview)) as image:
+        assert max(image.size) <= 16

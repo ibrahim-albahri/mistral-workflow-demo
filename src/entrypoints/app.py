@@ -47,6 +47,7 @@ COMMON_FIELD_LABELS = {
 }
 
 STEPS_CONFIG = [
+    ("preprocess", "Adaptive Image Preprocessing"),
     ("ocr", "✅ Document Preparation"),
     ("classify", "🏷️ Classification"),
     ("extract", "🧾 Personal Document Extraction"),
@@ -244,11 +245,14 @@ def backfill_steps_from_execution_result(steps: dict, result: Any) -> dict:
     if not isinstance(structured, dict):
         structured = result_mapping
 
+    preprocessing = structured.get("preprocessing")
     ocr_text = structured.get("ocr_text")
     classification = structured.get("classification")
     personal_document_info = structured.get("personal_document_info")
 
     updated = dict(steps)
+    if isinstance(preprocessing, dict):
+        updated["preprocess"] = {"status": "done", "result": preprocessing}
     if ocr_text is not None:
         updated["ocr"] = {"status": "done", "result": ocr_text}
     if isinstance(classification, dict):
@@ -298,7 +302,16 @@ def render_step(key: str, step: dict):
             st.session_state.signal_sent = True
             st.rerun()
     elif status == "done" and result is not None:
-        if key == "ocr":
+        if key == "preprocess":
+            operations = result.get("operations") or []
+            if result.get("status") == "skipped":
+                st.caption(result.get("reason") or result.get("error") or "Skipped")
+            elif operations:
+                st.markdown("Applied: " + ", ".join(operations))
+                st.caption(result.get("rationale", ""))
+            else:
+                st.caption(result.get("rationale", "No preprocessing was needed."))
+        elif key == "ocr":
             st.markdown("✅ Prepared for Document QnA")
             if isinstance(result, str) and result.strip():
                 st.caption(result)
@@ -393,10 +406,6 @@ if "batch_error" not in st.session_state:
     st.session_state.batch_error = None
 if "single_upload_identity" not in st.session_state:
     st.session_state.single_upload_identity = None
-if "single_enhanced_bytes" not in st.session_state:
-    st.session_state.single_enhanced_bytes = None
-if "single_enhancement_error" not in st.session_state:
-    st.session_state.single_enhancement_error = None
 if "batch_upload_identity" not in st.session_state:
     st.session_state.batch_upload_identity = None
 if "batch_enhanced_bytes" not in st.session_state:
@@ -418,34 +427,6 @@ if uploaded is not None:
     upload_identity = (filename, uploaded.size)
     if st.session_state.single_upload_identity != upload_identity:
         st.session_state.single_upload_identity = upload_identity
-        st.session_state.single_enhanced_bytes = None
-        st.session_state.single_enhancement_error = None
-
-    if content_type.startswith("image/"):
-        if st.button("Enhance image", key="enhance_single_image"):
-            try:
-                st.session_state.single_enhanced_bytes = preprocess_image_bytes(
-                    document_bytes
-                )
-                st.session_state.single_enhancement_error = None
-            except (RuntimeError, ValueError) as exc:
-                st.session_state.single_enhanced_bytes = None
-                st.session_state.single_enhancement_error = str(exc)
-
-        if st.session_state.single_enhancement_error:
-            st.warning(
-                "Image enhancement failed; the original image will be uploaded. "
-                f"{st.session_state.single_enhancement_error}"
-            )
-        elif st.session_state.single_enhanced_bytes is not None:
-            st.success("Enhanced image ready. Start Workflow will use this PNG.")
-            original_preview, enhanced_preview = st.columns(2)
-            with original_preview:
-                st.caption("Original")
-                st.image(document_bytes, width="stretch")
-            with enhanced_preview:
-                st.caption("Enhanced")
-                st.image(st.session_state.single_enhanced_bytes, width="stretch")
 
     if st.button("Start Workflow", type="primary"):
         st.session_state.execution_id = None
@@ -453,13 +434,6 @@ if uploaded is not None:
         st.session_state.steps = {}
         st.session_state.poll_error = None
         st.session_state.signal_sent = False
-
-        document_bytes, filename, content_type = upload_payload(
-            document_bytes,
-            filename,
-            content_type,
-            st.session_state.single_enhanced_bytes,
-        )
 
         with st.status("Uploading document…", expanded=False) as s:
             file_id = run_async(upload_document(document_bytes, filename, content_type))
