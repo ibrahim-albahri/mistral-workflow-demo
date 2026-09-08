@@ -15,43 +15,26 @@ import streamlit as st
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
-try:
-    import fitz  # PyMuPDF
-except ImportError:
-    fitz = None
-
 from mistralai.client import Mistral
 from mistralai.workflows.client import get_mistral_client
 from shared.document_media import (
     SUPPORTED_DOCUMENT_EXTENSIONS,
     get_document_content_type,
 )
-from shared.extraction_display import format_extraction_value
 from shared.extraction_fields import PERSONAL_DOCUMENT_LABELS
 from shared.preprocessing import preprocess_image_bytes, upload_payload
+from shared.streamlit_ui import (
+    COMMON_FIELD_LABELS,
+    STEPS_CONFIG,
+    get_document_preview,
+)
+from shared.streamlit_ui import render_step as render_shared_step
 from shared.workflow_results import workflow_result_mapping, workflow_status_name
 
 load_dotenv(override=True)
 
 API_KEY = os.environ["MISTRAL_API_KEY"]
 BASE_URL = os.environ.get("SERVER_URL", "https://api.mistral.ai")
-
-COMMON_FIELD_LABELS = {
-    "full_name": "Full Name",
-    "date_of_birth": "Date of Birth",
-    "document_number": "Document Number",
-    "issue_date": "Issue Date",
-    "expiry_date": "Expiry Date",
-    "nationality": "Nationality",
-    "address": "Address",
-}
-
-STEPS_CONFIG = [
-    ("preprocess", "Adaptive Image Preprocessing"),
-    ("ocr", "✅ Document Preparation"),
-    ("classify", "🏷️ Classification"),
-    ("extract", "🧾 Personal Document Extraction"),
-]
 
 
 class PersonalDocumentInput(BaseModel):
@@ -262,106 +245,15 @@ def backfill_steps_from_execution_result(steps: dict, result: Any) -> dict:
     return updated
 
 
-def get_document_preview(document_bytes: bytes, content_type: str):
-    if content_type.startswith("image/"):
-        return document_bytes
-    if content_type != "application/pdf" or not fitz:
-        return None
-    try:
-        doc = fitz.open(stream=document_bytes, filetype="pdf")
-        page = doc[0]
-        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-        img_bytes = pix.tobytes("ppm")
-        return io.BytesIO(img_bytes)
-    except Exception:
-        return None
-
-
 def render_step(key: str, step: dict):
-    status = step.get("status", "pending")
-    result = step.get("result")
+    """Shared step panels, with the workflow's manual-category signal wired in."""
 
-    if status == "pending":
-        st.markdown("⏳ Pending…")
-    elif status == "running":
-        st.markdown("⚙️ In Progress…")
-    elif status == "waiting_human":
-        result = step.get("result", {})
-        confidence = result.get("confidence", 0.0) if result else 0.0
-        st.warning(
-            f"⚠️ Insufficient confidence ({confidence * 100:.0f}%). Please choose the category manually."
-        )
-        selected = st.selectbox(
-            "Category",
-            options=list(PERSONAL_DOCUMENT_LABELS.keys()),
-            format_func=lambda k: PERSONAL_DOCUMENT_LABELS[k],
-            key="manual_category_select",
-        )
-        if st.button("Validate", key="manual_category_submit"):
-            run_async(send_signal(st.session_state.execution_id, selected))
-            st.session_state.signal_sent = True
-            st.rerun()
-    elif status == "done" and result is not None:
-        if key == "preprocess":
-            operations = result.get("operations") or []
-            if result.get("status") == "skipped":
-                st.caption(result.get("reason") or result.get("error") or "Skipped")
-            elif operations:
-                st.markdown("Applied: " + ", ".join(operations))
-                st.caption(result.get("rationale", ""))
-            else:
-                st.caption(result.get("rationale", "No preprocessing was needed."))
-        elif key == "ocr":
-            st.markdown("✅ Prepared for Document QnA")
-            if isinstance(result, str) and result.strip():
-                st.caption(result)
-        elif key == "classify":
-            category = result.get("category", "gtc")
-            confidence = result.get("confidence", 0.0)
-            explanation = result.get("explanation", "")
-            label = PERSONAL_DOCUMENT_LABELS.get(category, f"❓ {category}")
-            col1, col2 = st.columns([3, 1])
-            col1.markdown(f"**{label}**")
-            col1.caption(explanation)
-            col2.metric("Confidence", f"{confidence * 100:.0f}%")
-            col2.progress(confidence)
-        elif key == "extract":
-            common = result.get("common", {})
-            specific = result.get("specific", {})
+    def send_manual_category(category: str) -> None:
+        run_async(send_signal(st.session_state.execution_id, category))
+        st.session_state.signal_sent = True
+        st.rerun()
 
-            st.markdown("**🧍 Common Information**")
-            common_rows = [
-                {
-                    "Field": COMMON_FIELD_LABELS.get(k, k),
-                    "Value": format_extraction_value(v),
-                }
-                for k, v in common.items()
-                if v is not None
-            ]
-            if common_rows:
-                st.table(common_rows)
-            else:
-                st.info("No common information found.")
-
-            if specific:
-                st.markdown("**📋 Specific Information**")
-                specific_rows = [
-                    {
-                        "Field": k.replace("_", " ").capitalize(),
-                        "Value": format_extraction_value(v),
-                    }
-                    for k, v in specific.items()
-                    if v is not None and k != "mrz"
-                ]
-                if specific_rows:
-                    st.table(specific_rows)
-                else:
-                    st.info("No specific information found.")
-
-                mrz = specific.get("mrz")
-                if isinstance(mrz, dict):
-                    st.markdown("**MRZ validation**")
-                    st.json(mrz, expanded=False)
+    render_shared_step(key, step, on_manual_category=send_manual_category)
 
 
 st.set_page_config(page_title="Personal Documents", page_icon="🧾", layout="wide")

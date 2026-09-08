@@ -42,6 +42,97 @@ Low-confidence classifications are presented for individual category review. Doc
 
 You can monitor execution progress and extracted data in [AI Studio](https://console.mistral.ai/build/workflows/).
 
+## Mistral Agents implementation
+
+`src/agents/` processes the same documents with the [Mistral Agents API](https://docs.mistral.ai/agents/agents_introduction/)
+instead of Workflows. There is no worker and no Temporal: the agents live on the
+API, and a run is a single stored conversation driven by an in-process orchestrator.
+
+### The agent chain
+
+Handoffs are one-way — a conversation stays on whichever agent it was handed to, and
+control never returns to the supervisor — so each agent carries the handoff to its
+own successor:
+
+```
+pdp-supervisor ──> pdp-preprocessor ──> pdp-classifier ──> pdp-extractor-<category>
+               └──────────────────────>┘
+```
+
+`pdp-supervisor` routes images through preprocessing and sends PDFs straight to
+classification. `pdp-preprocessor` owns the two OpenCV function tools
+(`inspect_document_image`, `apply_preprocessing_operation`), which the orchestrator
+executes locally and returns as `function.result` entries. There is one extractor
+agent **per category**, because the API rejects `completion_args` on an agent-bound
+conversation — a response schema has to be baked into the agent at creation time, and
+the extraction schema differs per category.
+
+### Running it
+
+```bash
+make agents-sync                        # create or refresh the pdp-* agents
+make agents-run file=passport.jpg       # process one document
+make agents-run file=passport.jpg threshold=1.0   # force manual category review
+make agents-streamlit                   # the UI
+make agents-delete                      # remove every pdp-* agent
+```
+
+Set `MISTRAL_SUPERVISOR_AGENT_MODEL` to override the supervisor's model; the
+classifier, extractor, and preprocessing models come from the same variables the
+workflow uses.
+
+`uv run python src/agents/probe_handoff.py` checks the four API behaviours this design
+relies on (server-side handoff, client-executed function tools, the `completion_args`
+rejection, and directed mid-conversation handoff) against the live API.
+
+### Differences from the workflow version
+
+| Workflow | Agents |
+| --- | --- |
+| durable `InteractiveWorkflow` + worker | in-process orchestrator, no worker |
+| `@workflows.activity` | plain function exposed as a `FunctionTool` |
+| `get_steps` query polled by the UI | `steps` dict on the run object |
+| `manual_category` signal + `wait_condition` | the run parks; the UI resumes its stored conversation |
+| activity retry policies | explicit backoff in `agents/files.py` |
+
+Both implementations share their schemas, prompts, and MRZ enrichment via
+`shared/personal_documents.py`, and their Streamlit step panels via
+`shared/streamlit_ui.py`, so their results are directly comparable.
+
+### Guard rails
+
+Temporal gives the workflow version budgets, retries and idempotency for free. Here
+each one is written and tested by hand, in `agents/orchestrator.py` unless noted:
+
+| Guard | Why it exists |
+| --- | --- |
+| `MAX_PREPROCESSING_OPERATIONS`, `MAX_TOOL_CALLS` | an agent that had spent its operations kept re-inspecting the image until the iteration cap |
+| no-repeat operation check | a repeated operation also fails `validate_preprocessing_decision`, discarding all preprocessing |
+| `_answered_tool_calls` | a retried append whose original succeeded re-sent a `function.result`, which the API rejects |
+| `_recover_from_history` | that rejection proves the work landed, so the run reads back what it missed instead of failing |
+| `call_with_retry` (`agents/files.py`) | 429/5xx/timeout backoff; the SDK's 30s default timeout is also raised to 300s |
+| `find_unusable_fields` (`shared/`) | extractors have copied MRZ text into ordinary fields, and swallowed sibling fields into a string — both parse as valid JSON |
+| one extraction retry, then strip + `warnings` | reports nothing rather than garbage, and names what it discarded |
+| `DESTRUCTIVE_OPERATIONS` (`agents/tools.py`) | `table_grid_removal` inpainted a passport's MRZ away; the agent is offered only what `conservative_ocr_config` enables |
+
+A run re-sends its whole conversation every turn, so image chains are token-hungry
+and can exhaust an account's rate limit; previews shown to the agent are capped at
+512px and sent once for the same reason.
+
+### Known limitations
+
+- **GTC extraction under-fills.** On a text PDF the extractor reliably returns
+  `acceptance_text` but leaves `document_title`, `issuer_name`, `version_date` and
+  `key_clauses` null. Whether the workflow's `chat.parse` path does better on the
+  same document is **not yet measured** — the comparison was blocked by rate limits.
+  Run `agents-run` and the workflow against one document before drawing conclusions.
+- **MRZ transcription fidelity** limits the enrichment: if the model mis-transcribes
+  the zone, `parse_mrz` rejects it and `enrich_with_mrz_fallback` correctly declines
+  to fill fields from it, so those fields stay null rather than becoming wrong.
+- The confidence gate is `confidence < threshold`, so a model returning exactly `1.0`
+  is never held for review even at `threshold=1.0`. This matches the workflow's
+  existing behaviour; use a threshold above 1.0 to force a review.
+
 ## Development
 
 ```bash
